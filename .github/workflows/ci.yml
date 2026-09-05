@@ -1,0 +1,110 @@
+name: CI
+
+# Every commit on every branch, every pull request against main, and the push
+# that lands when a pull request is merged into main.
+#
+# Tag pushes deliberately do not match: `branches:` never matches a tag ref, so
+# cutting a release cannot start a second pipeline for the commit it just built.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Supersede the previous run for the same branch or PR. A branch that also has
+# an open PR gets one run per event in two separate groups, so neither run can
+# cancel the other's checks out from under branch protection.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  # The whole thing, on every commit: resolve the version, download the three
+  # components, verify them against upstream's digests and the committed pin,
+  # assemble what ships, and read it back.
+  #
+  # Nothing is compiled and no toolchain is downloaded - this repository
+  # repackages upstream's own aarch64-musl build - so the wall-clock is one
+  # 156 MiB download plus a copy.
+  #
+  # `release.yml` is triggered by hand, but it looks for a successful run of
+  # this workflow on the commit being released and refuses to publish without
+  # one - so this job is the gate a release passes.
+  # -------------------------------------------------------------------------
+  build:
+    name: assemble the Rust toolchain
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The container the sibling repositories build in. Unlike theirs, the host
+    # makes no difference to what comes out here: nothing is compiled, so the
+    # asset is upstream's own binaries repacked, and macOS and Linux produce
+    # the same tree. The container is for consistency, not correctness.
+    container: debian:trixie-slim
+    steps:
+      # Before checkout on purpose: without git in the container,
+      # actions/checkout silently falls back to downloading a tarball.
+      #
+      # The shortest package list in the family, and deliberately so: nothing
+      # here is compiled, so there is no compiler, no toolchain and no jq.
+      #
+      # xz-utils is not optional: upstream ships .tar.xz and `make dist` packs
+      # with xz -9.
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            make git curl ca-certificates xz-utils
+
+      - uses: actions/checkout@v5
+
+      # 156 MiB from static.rust-lang.org, checked against the .sha256
+      # upstream publishes beside each tarball *and* against the digests
+      # committed here. The first catches a truncated download; the second is
+      # the pin that says which bytes 1.98.1 is.
+      - name: Download and verify the components
+        run: make sources
+
+      - name: Check them against the committed digests
+        run: make verify-downloads
+
+      # Unpack, assemble the tree, drop what the card has no use for.
+      - name: Assemble what ships
+        run: make stage
+
+      # Reads the staged tree back: bin/rustc and bin/cargo are AArch64 and ask
+      # for the musl loader, librustc_driver and libstd are where the shim will
+      # look for them, the licences are staged, and no libc came along.
+      - name: Verify the staged toolchain
+        run: make stage-check
+
+      # Run here too, so the release path is exercised on every commit rather
+      # than for the first time during a release. It is several minutes of
+      # xz -9 over 725 MiB, which is the bulk of this job.
+      - name: Pack the release asset
+        run: make dist
+
+      - name: What was built
+        run: make sources-info stage-info dist-info
+
+      # No artifact upload, unlike every sibling. Theirs are between 348 KB and
+      # 60 MiB, so uploading from every branch is nearly free; this one is a few
+      # hundred MiB and would be uploaded on every push to no purpose. The
+      # release workflow publishes it; this job proves it can be built.
+
+      # There are no build logs to upload - nothing is compiled - so what is
+      # worth having from a failed run is which version it resolved and which
+      # flags it staged with.
+      - name: Upload what it resolved
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: build-logs
+          path: |
+            build/version.env
+            build/stage/.config
+          if-no-files-found: ignore

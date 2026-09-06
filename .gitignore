@@ -62,9 +62,13 @@ Temporary Items
 # iCloud generated files
 *.icloud
 
-### premake-gmake ###
-Makefile
-*.make
+### SepiaOS: the premake-gmake section is deliberately not here ###
+#
+# It ignored `Makefile` and `*.make`. This repository's entire build *is* a
+# Makefile, so the first push left it out of the repository and CI failed with
+# "No rule to make target 'sources'" - a checkout with no build in it. Nothing
+# here uses premake. Kept out for the same reason the C section's `*.d` is:
+# a generated ignore file is a list of somebody else's assumptions.
 obj/
 
 ### Rust ###

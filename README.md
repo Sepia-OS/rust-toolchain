@@ -56,6 +56,7 @@ Run `gmake help` for the full list.
 | `help` | targets and variables (the default goal) |
 | `version` | resolve which Rust version this build ships |
 | `version-update` | re-resolve the current stable |
+| `bump` | move the pin to `VERSION=` and record that version's digests |
 | `sources` | download `rustc`, `cargo` and `rust-std`, check them against upstream's digests and the committed pin |
 | `verify-downloads` | check the components against the committed digests |
 | `stage` | unpack the components, assemble the tree, prune what the card does not want |
@@ -114,6 +115,26 @@ The two largest single savings, both measured:
 |---|---|
 | `WITH_RUST_LLD=0` | −163 MiB. The card already has `ld.lld` from `llvm`, so this ships a second copy of LLD. It is kept by default because `rustc` reaches for it under `-Clinker-flavor=*-lld`, and a toolchain that fails at link time on a card that is hard to debug is a poor trade for a flag nobody set. |
 | `WITH_STRIP=1` | −98 MiB (`librustc_driver` 280→204, `rust-lld` 147→125). Off by default because it is the one thing here that needs a cross-toolchain, and this repository otherwise downloads none. Set `CROSS_COMPILE` to a prefix you already have. |
+
+## Keeping up with upstream
+
+`.github/workflows/update.yml` asks upstream once a week — Mondays, 06:17 UTC —
+whether stable has moved past the pin. If it has, it runs `make bump`, which
+moves `RUST_VERSION` *and* records the new version's digests, and opens the
+result as a branch and a pull request. It publishes nothing and merges nothing:
+the machine notices, a person decides.
+
+It is idempotent by branch name, so a run that finds last week's branch still
+open does nothing. Deleting the branch is what asks for it to be raised again.
+
+> A branch pushed with `GITHUB_TOKEN` does not start a workflow run, and
+> neither does a pull request opened with it — GitHub refuses that deliberately.
+> So **CI does not run on the branch**; start it by hand from the Actions tab
+> before merging. The pull request body says so too.
+
+```sh
+make bump VERSION=1.99.0     # what the workflow runs: move the pin, record the digests
+```
 
 ## Verification
 

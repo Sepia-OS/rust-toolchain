@@ -1,0 +1,198 @@
+name: Rust update check
+
+# Asks upstream once a week whether stable has moved past the version this
+# repository pins, and if it has, opens the change as a branch and a pull
+# request rather than doing anything with it.
+#
+# Rust cuts a stable release every six weeks, on a Thursday. Monday morning is
+# late enough to catch one and rare enough that the job is nearly free; the
+# odd minute is deliberate, because everything scheduled on the hour competes
+# with everything else scheduled on the hour.
+#
+# Nothing here publishes, tags or releases. It moves a pin and asks a person -
+# which is the same shape as release.yml being manual: the machine notices, the
+# human decides.
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+# One at a time, and never cancelled: a run that is halfway through pushing a
+# branch should finish doing that.
+concurrency:
+  group: rust-update
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check for a newer Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Not debian:trixie-slim, unlike ci.yml and release.yml. This job needs
+    # `gh`, which Debian does not package - the same reason release.yml's
+    # publish job runs on the bare runner - and it produces no asset, so the
+    # container's job of "build where the release is built" does not apply. The
+    # runner has make 4.3, curl, tar and xz, which is the whole prerequisite
+    # list.
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+
+      # Both numbers come out of the Makefile rather than being parsed here:
+      # `print-RUST_VERSION` is the pin as committed, and `version-update`
+      # followed by `print-RUST_VER` with an empty pin is the documented way to
+      # ask upstream's own channel manifest what stable is now. A second
+      # implementation of that parser living in a workflow is how the two
+      # answers start disagreeing.
+      - name: Ask upstream what stable is
+        id: check
+        run: |
+          pinned="$(make -s print-RUST_VERSION)"
+          make RUST_VERSION= version-update
+          latest="$(make -s RUST_VERSION= print-RUST_VER)"
+          [ -n "$pinned" ] && [ -n "$latest" ] || {
+            echo "::error::could not read both versions (pinned='$pinned' latest='$latest')"
+            exit 1
+          }
+          {
+            echo "pinned=$pinned"
+            echo "latest=$latest"
+            echo "branch=update/rust-${latest}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$pinned" = "$latest" ]; then
+            echo "state=current" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Up to date::Pinned at ${pinned}, which is current stable."
+            echo "Rust **${pinned}** is current stable. Nothing to do." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # sort -V decides which way round they are. Upstream going
+          # *backwards* is not a thing to open a pull request about - it means
+          # a yanked release or a manifest being served oddly - so it is said
+          # out loud and left alone.
+          newest="$(printf '%s\n%s\n' "$pinned" "$latest" | sort -V | tail -1)"
+          if [ "$newest" = "$pinned" ]; then
+            echo "state=behind" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Upstream is older::Pinned at ${pinned}, upstream stable says ${latest}. Not touching it."
+            exit 0
+          fi
+
+          echo "state=newer" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Rust ${latest} is out::Pinned at ${pinned}."
+
+      # Idempotent by branch name: a run that finds last week's branch still
+      # open does nothing rather than opening a second one for the same
+      # version. Deleting the branch is what asks for it to be raised again.
+      - name: Has this one already been raised?
+        id: branch
+        if: steps.check.outputs.state == 'newer'
+        env:
+          BRANCH: ${{ steps.check.outputs.branch }}
+        run: |
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Already raised::${BRANCH} exists; leaving it alone."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # `make bump` does both halves: it moves the pin *and* fetches the new
+      # components so that checksums/rust-<new>.sha256 is recorded. A commit
+      # with only the Makefile line changed would leave the new version
+      # unpinned until somebody happened to build it. That is 156 MiB of
+      # download, which is why this step only runs when there is something to
+      # bump to.
+      - name: Move the pin and record the new digests
+        if: steps.check.outputs.state == 'newer' && steps.branch.outputs.exists == 'false'
+        run: make bump VERSION=${{ steps.check.outputs.latest }}
+
+      - name: Push the branch
+        id: push
+        if: steps.check.outputs.state == 'newer' && steps.branch.outputs.exists == 'false'
+        env:
+          BRANCH: ${{ steps.check.outputs.branch }}
+          PINNED: ${{ steps.check.outputs.pinned }}
+          LATEST: ${{ steps.check.outputs.latest }}
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -b "$BRANCH"
+          git add Makefile checksums
+          git status --short
+          git commit -m "Move the Rust pin from ${PINNED} to ${LATEST}" \
+                     -m "Opened by .github/workflows/update.yml. The digests in checksums/ were recorded by 'make bump', which fetched the components and verified them against upstream's own .sha256 files."
+          git push origin "$BRANCH"
+
+      # The pull request *is* the notification: opening one mails every watcher
+      # of the repository and puts the diff where it can be read.
+      #
+      # One honest caveat, in the body as well as here: a branch pushed with
+      # GITHUB_TOKEN does not start a workflow run, and neither does a pull
+      # request opened with it. GitHub refuses that deliberately, to stop
+      # workflows triggering workflows. So the CI run that would say "1.99.0
+      # assembles" has to be started by hand from the Actions tab, or this job
+      # has to be given a PAT instead. Rather than pretend otherwise, the body
+      # says which button to press.
+      - name: Open the pull request
+        if: steps.check.outputs.state == 'newer' && steps.branch.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.check.outputs.branch }}
+          PINNED: ${{ steps.check.outputs.pinned }}
+          LATEST: ${{ steps.check.outputs.latest }}
+        run: |
+          cat > body.md <<BODY
+          Upstream stable has moved to **${LATEST}**; this repository pinned **${PINNED}**.
+
+          \`make bump VERSION=${LATEST}\` moved the pin and recorded
+          \`checksums/rust-${LATEST}.sha256\`, having fetched all three
+          components and checked them against the \`.sha256\` files upstream
+          publishes beside them. Both changes are in this branch.
+
+          **CI has not run on this branch.** A branch pushed by
+          \`GITHUB_TOKEN\` does not start a workflow, and neither does a pull
+          request opened by it — so start one from the Actions tab
+          (\`CI\` → *Run workflow* → \`${BRANCH}\`) before merging, or merge and
+          let it run on \`main\`.
+
+          Worth a look before merging:
+
+          - the release notes for ${LATEST}, for anything that changes what a
+            card needs;
+          - \`make stage-info\` on the branch, since the unpacked size is the
+            number that decides whether the toolchain still fits;
+          - whether \`Sepia-OS/rootfs\` pins a \`rust\` release that has to move
+            with it.
+
+          Opened by \`.github/workflows/update.yml\`.
+          BODY
+
+          if gh pr list --head "$BRANCH" --state open --json number --jq 'length' | grep -qv '^0$'; then
+            echo "::notice title=Pull request exists::One is already open for ${BRANCH}."
+            exit 0
+          fi
+
+          url="$(gh pr create \
+            --title "Rust ${LATEST} is available (pinned: ${PINNED})" \
+            --body-file body.md \
+            --head "$BRANCH" \
+            --base main)"
+          echo "::notice title=Opened::${url}"
+          {
+            echo "## Rust ${LATEST} is available"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Pinned | \`${PINNED}\` |"
+            echo "| Upstream stable | \`${LATEST}\` |"
+            echo "| Branch | \`${BRANCH}\` |"
+            echo "| Pull request | ${url} |"
+            echo
+            echo "CI has not run on the branch - see the pull request for why."
+          } >> "$GITHUB_STEP_SUMMARY"

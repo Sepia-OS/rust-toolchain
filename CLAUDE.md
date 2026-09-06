@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Implemented and green end to end.** [Makefile](Makefile) resolves a Rust version, downloads `rustc`, `cargo` and `rust-std` for `aarch64-unknown-linux-musl`, verifies them twice, assembles what ships and packs it. Verified on macOS/arm64 against 1.98.1: **725 MiB staged**, `bin/rustc`, `bin/cargo` and `bin/rustdoc` all AArch64 on the musl loader, `librustc_driver` and `libstd` in place.
 
+The first CI run failed before it reached any of that, for a reason worth keeping: the generated `.gitignore` ignored `Makefile`. See the constraint below.
+
 **That is a layout proof, not a behavioural one**, and here the gap is real: nothing has *run* `rustc` on aarch64. A card also needs a linker before Rust can produce a binary — `cc` from `../llvm` — so "Rust works on the device" stays a claim until a board says otherwise.
 
 What does not exist yet: a published release, and therefore a consumer. Nothing in `../rootfs` fetches this yet, and **725 MiB does not fit** on the current 512 MiB image; see the size section below before wiring it up.
@@ -93,7 +95,8 @@ Verified across `../boot`, `../rootfs`, `../llvm`, `../make`, `../e2fsprogs`, `.
 - **`print-%` exposes any variable to CI**, which makes the names it is called with a CI contract: `DIST_ASSET`, `RUST_VER`, `RUST_VERSION`, `RUST_TARGET`.
 - **`.SHELLFLAGS := -eu -o pipefail`.**
 - **ELF files are recognised by their magic, not by `file`** — `file` is absent from `debian:trixie-slim` and the two implementations word their answers differently.
-- **The `.gitignore` deliberately omits the stock toptal C/C++ sections.** Its `*.d` pattern also matches *directories* named `*.d`, which is how `../rootfs` silently failed to commit `overlay/etc/init.d`. They were removed from the generated file this repository started with; keep them out.
+- **The `.gitignore` deliberately omits the stock toptal C/C++ *and* premake-gmake sections**, and the second one has already cost a CI run. The generated file this repository started with was made for `...,c,c++,premake-gmake`, and premake's section ignores **`Makefile`** — so the first push left the entire build out of the repository and CI failed with `No rule to make target 'sources'`: a checkout with nothing in it to run. The C section's `*.d` is the same trap one step earlier, matching *directories* named `*.d`, which is how `../rootfs` silently failed to commit `overlay/etc/init.d`. A generated ignore file is a list of somebody else's assumptions; read it before committing to it.
+- **`git check-ignore -v <path>` is how to check that quickly**, and it is worth running against `Makefile` in any repository that starts from a generated `.gitignore`. The other seven SepiaOS repositories were checked and are clean.
 - **Apache 2.0** for this repository; Rust is dual MIT/Apache-2.0 and its `COPYRIGHT` and licence texts ship inside the release asset.
 - **`README.md` is the specification and stays in sync.** Changing a target, a variable or a default means updating it in the same change.
 
@@ -109,6 +112,8 @@ Both files are the `../musl` pair with the names changed; `../boot/docs/CI.md` i
 - **`inputs.version` reaches bash through `env:`, never `${{ }}` interpolation into a script line.** Validate against `^[0-9][0-9A-Za-z.+-]*$`.
 - **The release body is an interface** the moment anything consumes this: state the version as `| rust | \`1.98.1\` |`, the way every sibling states its own.
 - Only the publishing job gets `contents: write`; `GITHUB_TOKEN` is the only credential needed.
+- **There is a third workflow here that the siblings do not have**, `update.yml`: a weekly check of upstream stable against the pin, which opens a branch and a pull request when they differ. It calls `make bump` rather than editing the Makefile itself, so the same change can be made by hand and reproduces verbatim. It runs on the bare runner rather than in the container, because it needs `gh` and produces no asset.
+- **A branch pushed with `GITHUB_TOKEN` starts no workflow run**, and neither does a pull request opened with it — GitHub refuses that so workflows cannot trigger workflows. So `update.yml` cannot hand over a *green* branch, only a correct one; the pull request body says which button to press. Giving that job a PAT would change this, and would also mean a credential in the repository that can push to `main`.
 
 ## Build Environment
 
